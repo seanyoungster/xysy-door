@@ -102,8 +102,12 @@ is enabled, nothing listens on 4850, and no log says why. Run the door by hand a
 ```
 
 It prints the port, the state file and the Hermes home it resolved, then either **Listening** or
-**THE DOOR DID NOT OPEN** with the reason. Ctrl+C to stop. As of 0.4.3 the same reason is written
-to stderr at startup (so it lands in the serve log) and returned by the plugin's `/status` route.
+**THE DOOR DID NOT OPEN** with the reason. Ctrl+C to stop.
+
+As of 0.4.3 the same reason is also written to stderr at startup and returned by the plugin's
+`/status` route. ⚠️ The stderr line was **not** observed in `hermes serve`'s own log during
+testing — Hermes may capture or discard plugin stderr — so treat running the module by hand as the
+reliable way to see it, not the log.
 
 ## Checking it works
 
