@@ -66,7 +66,7 @@ try:  # Hermes imports this file for `router`; the import must never break serve
 except Exception:  # pragma: no cover - only when FastAPI is absent
     APIRouter = None
 
-DOOR_VERSION = "0.4.2"
+DOOR_VERSION = "0.4.3"
 DOOR_PORT = int(os.environ.get("XYSY_DOOR_PORT", "4850"))
 
 # Who may knock. A browser sends its page's origin; anything not on this list is
@@ -1362,31 +1362,55 @@ class _Door(BaseHTTPRequestHandler):
 
 _server = None
 _thread = None
+# Why the door is not open, when it is not. Empty means "no reason recorded" — which, after
+# start_door() has run, means it opened.
+_door_error = ""
+
+
+def _say(msg: str) -> None:
+    """One line to stderr, so it reaches `hermes serve`'s log. Never raises."""
+    try:
+        sys.stderr.write("[xysy-door] " + msg + "\\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
 
 
 def start_door() -> None:
     """Open the door once, in the background, and never take Hermes down with it."""
-    global _server, _thread
+    global _server, _thread, _door_error
     if _server is not None:
         return
     try:
         _server = ThreadingHTTPServer(("127.0.0.1", DOOR_PORT), _Door)
-    except OSError:
-        # Almost always "already listening" — a second Hermes profile, or a reload.
-        # Not worth a crash: the door that IS up is serving.
+    except OSError as exc:
+        # Usually "already listening" — a second Hermes profile, or a reload — and that is
+        # harmless, because the door that IS up is serving. But it can equally be a refused
+        # bind, and returning silently there is how a computer ends up with a running Hermes,
+        # an enabled plugin, no door, and nothing anywhere saying why. Say it either way.
         _server = None
+        _door_error = "could not bind 127.0.0.1:%d - %s" % (DOOR_PORT, exc)
+        _say(_door_error)
         return
     _server.daemon_threads = True
     _thread = threading.Thread(target=_server.serve_forever, name="xysy-door", daemon=True)
     _thread.start()
+    _door_error = ""
+    _say("listening on 127.0.0.1:%d (door %s)" % (DOOR_PORT, DOOR_VERSION))
 
 
 # Hermes imports this module at startup when the plugin is enabled, so this is our
 # only hook. Wrapped because a plugin must never be the reason `hermes serve` fails.
 try:
     start_door()
-except Exception:
-    pass
+except Exception as _exc:                      # noqa: BLE001 - a plugin must never break serve
+    _door_error = "the door did not start - %s: %s" % (type(_exc).__name__, _exc)
+    _say(_door_error)
+    try:
+        import traceback as _tb
+        _tb.print_exc()
+    except Exception:
+        pass
 
 # Hermes also wants a router. Ours adds nothing to Hermes' own screens; it exists so
 # the plugin loads at all, and so `hermes serve`'s own UI can show the door's state.
@@ -1398,6 +1422,45 @@ if APIRouter is not None:
         state = _load()
         return {"ok": True, "door": "xysy", "version": DOOR_VERSION, "port": DOOR_PORT,
                 "listening": _server is not None,
+                # The whole point: a door that is not listening can be ASKED why, from Hermes'
+                # own screens, without anybody reading a log.
+                "error": _door_error,
                 "paired": bool(state.get("token")), "email": state.get("email") or ""}
 else:  # pragma: no cover
     router = None
+
+
+# ---------------------------------------------------------------------------------------------
+# Run the door BY HAND and watch it:
+#
+#     ~/.hermes/hermes-agent/venv/bin/python ~/.hermes/plugins/xysy/dashboard/api.py
+#
+# `hermes serve` starts the door in a daemon thread wrapped so a plugin can never break serve.
+# That is correct, and it means a door that fails to open is invisible. This is the way to see it.
+if __name__ == "__main__":
+    print("")
+    print("  XYSY door %s" % DOOR_VERSION)
+    print("  port        : %d" % DOOR_PORT)
+    print("  state file  : %s" % STATE)
+    print("  hermes home : %s" % os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
+    print("")
+    # start_door() already ran at import. This either returns immediately (already open) or
+    # retries and records why not.
+    start_door()
+    if _server is None:
+        print("  THE DOOR DID NOT OPEN")
+        print("  %s" % (_door_error or "no reason recorded"))
+        print("")
+        print("  If it says the address is in use, something already holds the port - which may")
+        print("  well be a door that is working. Check with:")
+        print("      curl -s http://127.0.0.1:%d/xysy/hello" % DOOR_PORT)
+        raise SystemExit(1)
+    print("  Listening. Ask it from another window with:")
+    print("      curl -s http://127.0.0.1:%d/xysy/hello" % DOOR_PORT)
+    print("")
+    print("  Ctrl+C to stop. (Hermes runs this for you normally - this is only for looking.)")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n  stopped.")

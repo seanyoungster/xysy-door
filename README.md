@@ -91,6 +91,20 @@ Replace `PYTHON` with `~/.hermes/hermes-agent/venv/bin/python` and `HERMES` with
 `~/.hermes/hermes-agent/hermes` (absolute paths — launchd does not expand `~`), then
 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.xysy.hermes-serve.plist`.
 
+## When the door does not open
+
+`hermes serve` starts the door in a daemon thread, wrapped so a plugin can never take Hermes down.
+That is correct, and it means a door that fails to start is **invisible** — Hermes runs, the plugin
+is enabled, nothing listens on 4850, and no log says why. Run the door by hand and it will tell you:
+
+```
+~/.hermes/hermes-agent/venv/bin/python ~/.hermes/plugins/xysy/dashboard/api.py
+```
+
+It prints the port, the state file and the Hermes home it resolved, then either **Listening** or
+**THE DOOR DID NOT OPEN** with the reason. Ctrl+C to stop. As of 0.4.3 the same reason is written
+to stderr at startup (so it lands in the serve log) and returned by the plugin's `/status` route.
+
 ## Checking it works
 
 ```
