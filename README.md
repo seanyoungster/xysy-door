@@ -7,15 +7,31 @@ XYSY installing an application of its own and without Claude Desktop needing to 
 
 ```
 hermes plugins install seanyoungster/xysy-door --enable
+hermes serve --stop
 hermes serve
 ```
 
-That is the whole thing. The first command clones the plugin into `~/.hermes/plugins/xysy` and adds
-it to `plugins.enabled`; the second runs Hermes' own server, which is what hosts the door. Then open
-[xysy.ai](https://xysy.ai) → **Set up Hermes** and press **↻ Try again**.
+The first command clones the plugin into `~/.hermes/plugins/xysy` and adds it to `plugins.enabled`.
+The other two **restart** Hermes' server. Then open [xysy.ai](https://xysy.ai) → **Set up Hermes**
+and press **↻ Try again**.
 
-To keep the server running after a reboot, run `hermes serve` from a login item — or on macOS, use
-the LaunchAgent recipe at the end of this file.
+🔴 **The restart is the step people miss.** Hermes discovers dashboard plugins when its server
+*starts*, so a server that was already running was started before this plugin existed and will
+never load it. Running plain `hermes serve` on a machine that already has one answers:
+
+```
+ERROR: [Errno 48] error while attempting to bind on address ('127.0.0.1', 9119): address already in use
+```
+
+— the install looks fine, nothing changes, and the app still reports that it cannot reach the
+computer. `hermes serve --stop` first is safe either way; with nothing running it just says so.
+
+⚠️ **Ignore the installer's own advice to run `hermes gateway restart`.** That manages the
+*messaging* gateway — Telegram, Discord, WhatsApp — not the backend server this plugin lives in.
+It will appear to succeed and change nothing.
+
+`hermes serve` runs in the foreground and stops when you close its window. To keep the door up
+after a reboot, use the LaunchAgent recipe at the end of this file.
 
 Update later with `hermes plugins update xysy`. Remove with `hermes plugins remove xysy`.
 
