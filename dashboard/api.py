@@ -53,6 +53,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -66,7 +67,7 @@ try:  # Hermes imports this file for `router`; the import must never break serve
 except Exception:  # pragma: no cover - only when FastAPI is absent
     APIRouter = None
 
-DOOR_VERSION = "0.4.3"
+DOOR_VERSION = "0.5.0"
 DOOR_PORT = int(os.environ.get("XYSY_DOOR_PORT", "4850"))
 
 # Who may knock. A browser sends its page's origin; anything not on this list is
@@ -1370,7 +1371,7 @@ _door_error = ""
 def _say(msg: str) -> None:
     """One line to stderr, so it reaches `hermes serve`'s log. Never raises."""
     try:
-        sys.stderr.write("[xysy-door] " + msg + "\\n")
+        sys.stderr.write("[xysy-door] " + msg + "\n")
         sys.stderr.flush()
     except Exception:
         pass
@@ -1399,6 +1400,109 @@ def start_door() -> None:
     _say("listening on 127.0.0.1:%d (door %s)" % (DOOR_PORT, DOOR_VERSION))
 
 
+
+# ---------------------------------------------------------------------------------------------
+# XY-DOORROOT - the door makes itself PERMANENT (v0.5.0).
+#
+# Sean, 2026-08-11, from the second Mac: the setup text ended with `hermes serve` running in a
+# Terminal window, so XYSY on that machine lived exactly as long as the window stayed open.
+# Closing it looked like "xysy.ai forgot this computer". A person should paste the setup ONCE
+# and never think about it again - no window to keep open, back by itself after a restart.
+#
+# So the first time the door runs on a Mac that has no launchd job, it writes one:
+# ~/Library/LaunchAgents/ai.xysy.hermes-serve.plist - the same job already proven on the first
+# Mac. The job's command SLEEPS briefly, then WAITS for Hermes' own port (9119) to be free
+# before starting `hermes serve`, so the copy launchd manages never fights a serve the person
+# started by hand; it simply takes over whenever that one goes away (window closed, crash,
+# reboot).
+#
+# Deliberately NOT done:
+#   * never overwrite an existing plist - the first Mac's hand-written job stays untouched;
+#   * nothing on Windows/Linux yet - Hermes on Windows is itself unrun; this returns a note
+#     instead of guessing at Scheduled Tasks;
+#   * no kickstart of the new job now - the serve this door lives in is already the server.
+#
+# XYSY_PERSIST_NO_LOAD=1 skips the launchctl registration - a test hook, so a test with a
+# scratch HOME can prove the plist without planting a job in the REAL launchd session.
+
+PERSIST_LABEL = "ai.xysy.hermes-serve"
+_persist_state = ""
+
+
+def _hermes_serve_argv():
+    """How THIS machine starts `hermes serve` - the ~/.hermes venv install first (what the
+    proven first-Mac plist runs), then whatever `hermes` is on PATH."""
+    agent = Path.home() / ".hermes" / "hermes-agent"
+    py, hm = agent / "venv" / "bin" / "python", agent / "hermes"
+    if py.exists() and hm.exists():
+        return [str(py), str(hm), "serve", "--skip-build"]
+    w = shutil.which("hermes")
+    if w:
+        return [w, "serve", "--skip-build"]
+    return None
+
+
+def _persist_plist_xml(argv):
+    import shlex
+    home = str(Path.home())
+    log = str(Path.home() / ".hermes" / "logs" / "serve-launchd.log")
+
+    def x(t):
+        return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # Sleep first so a serve that is starting RIGHT NOW (the one loading this plugin) gets to
+    # bind 9119 before we look; then wait until the port is free, then BECOME the server.
+    cmd = ("/bin/sleep 5; while /usr/bin/nc -z 127.0.0.1 9119 2>/dev/null; do /bin/sleep 30; "
+           "done; exec " + " ".join(shlex.quote(a) for a in argv))
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+        ' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0"><dict>\n'
+        "  <key>Label</key><string>%s</string>\n"
+        "  <key>ProgramArguments</key><array>\n"
+        "    <string>/bin/sh</string>\n    <string>-c</string>\n    <string>%s</string>\n"
+        "  </array>\n"
+        "  <key>EnvironmentVariables</key><dict>\n"
+        "    <key>PATH</key><string>%s/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>\n"
+        "    <key>HOME</key><string>%s</string>\n"
+        "  </dict>\n"
+        "  <key>WorkingDirectory</key><string>%s</string>\n"
+        "  <key>RunAtLoad</key><true/>\n"
+        "  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n"
+        "  <key>StandardOutPath</key><string>%s</string>\n"
+        "  <key>StandardErrorPath</key><string>%s</string>\n"
+        "</dict></plist>\n"
+    ) % (PERSIST_LABEL, x(cmd), x(home), x(home), x(home), x(log), x(log))
+
+
+def ensure_persistence():
+    """Make `hermes serve` - and with it this door - outlive the window that started it.
+    Returns a short note of what happened; never raises past its caller's wrap."""
+    if sys.platform != "darwin":
+        return "not-macos"
+    plist = Path.home() / "Library" / "LaunchAgents" / (PERSIST_LABEL + ".plist")
+    if plist.exists():
+        return "already-persistent"
+    argv = _hermes_serve_argv()
+    if not argv:
+        return "hermes-not-found"
+    try:
+        plist.parent.mkdir(parents=True, exist_ok=True)
+        tmp = plist.with_suffix(".plist.part")
+        tmp.write_text(_persist_plist_xml(argv), encoding="utf-8")
+        tmp.replace(plist)
+    except Exception as exc:
+        return "could-not-write - %s" % exc
+    if not os.environ.get("XYSY_PERSIST_NO_LOAD"):
+        try:
+            subprocess.run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(plist)],
+                           capture_output=True, timeout=10)
+        except Exception:
+            pass
+    return "installed"
+
+
 # Hermes imports this module at startup when the plugin is enabled, so this is our
 # only hook. Wrapped because a plugin must never be the reason `hermes serve` fails.
 try:
@@ -1411,6 +1515,15 @@ except Exception as _exc:                      # noqa: BLE001 - a plugin must ne
         _tb.print_exc()
     except Exception:
         pass
+
+# The door is up (or said why not); now make sure it OUTLIVES the process it lives in.
+try:
+    _persist_state = ensure_persistence()
+    if _persist_state != "already-persistent":
+        _say("persistence: " + _persist_state)
+except Exception as _pexc:  # noqa: BLE001 - a plugin must never break serve
+    _persist_state = "failed - %s: %s" % (type(_pexc).__name__, _pexc)
+    _say("persistence: " + _persist_state)
 
 # Hermes also wants a router. Ours adds nothing to Hermes' own screens; it exists so
 # the plugin loads at all, and so `hermes serve`'s own UI can show the door's state.
@@ -1425,6 +1538,7 @@ if APIRouter is not None:
                 # The whole point: a door that is not listening can be ASKED why, from Hermes'
                 # own screens, without anybody reading a log.
                 "error": _door_error,
+                "persistent": _persist_state in ("already-persistent", "installed"),
                 "paired": bool(state.get("token")), "email": state.get("email") or ""}
 else:  # pragma: no cover
     router = None
