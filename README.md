@@ -31,7 +31,14 @@ computer. `hermes serve --stop` first is safe either way; with nothing running i
 It will appear to succeed and change nothing.
 
 `hermes serve` runs in the foreground and stops when you close its window. To keep the door up
-after a reboot, use the LaunchAgent recipe at the end of this file.
+after a reboot, run this once:
+
+```
+bash ~/.hermes/plugins/xysy/keep-serving.sh
+```
+
+It writes a LaunchAgent, starts it, and then asks the door whether it answered. Safe to run twice;
+removes nothing. To undo, see the end of this file.
 
 Update later with `hermes plugins update xysy`. Remove with `hermes plugins remove xysy`.
 
