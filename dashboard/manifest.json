@@ -1,0 +1,8 @@
+{
+  "name": "xysy",
+  "label": "XYSY",
+  "description": "Lets XYSY on the web drive the creative applications on this computer.",
+  "version": "0.1.0",
+  "api": "api.py",
+  "tab": { "hidden": true }
+}
