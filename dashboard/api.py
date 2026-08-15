@@ -67,7 +67,8 @@ try:  # Hermes imports this file for `router`; the import must never break serve
 except Exception:  # pragma: no cover - only when FastAPI is absent
     APIRouter = None
 
-DOOR_VERSION = "0.5.0"
+# A blank page at :4850/xysy is a STALE door, not a broken one - this is the fingerprint.
+DOOR_VERSION = "0.6.0"
 DOOR_PORT = int(os.environ.get("XYSY_DOOR_PORT", "4850"))
 
 # Who may knock. A browser sends its page's origin; anything not on this list is
@@ -1121,6 +1122,121 @@ def _job_cloud_link_status(_args: dict) -> dict:
             "email": state.get("email") or "", "expiresAt": int(expires), "via": "door"}
 
 
+# --------------------------------------------------------------- XY-DOORPARITY jobs
+def _job_run_progress(args: dict) -> dict:
+    """The run's own progress ledger, byte-identical in shape to the Local Agent's.
+
+    Read straight off disk and never synthesised. The shape matters more than it looks:
+    the page treats a FAILED call as {status:'error', steps:[]}, so a door that could not
+    answer this made every finished run look like a crash that produced nothing. A run
+    folder with no progress.json yet is 'queued', not an error - that distinction is the
+    entire fix.
+    """
+    d = Path(str(args.get("dir") or ""))
+    run_id = str(args.get("runId") or "")
+    if not run_id or not _inside_projects(d):
+        return {"ok": True, "run": None}
+    f = d / "runs" / run_id / "progress.json"
+    if not f.is_file():
+        return {"ok": True, "run": {"runId": run_id, "status": "queued", "steps": []}}
+    try:
+        return {"ok": True, "run": json.loads(f.read_text(encoding="utf-8"))}
+    except Exception as exc:
+        # Half-written by a run that is mid-save. 'running' with no steps is honest;
+        # 'error' would be a verdict the door is not entitled to reach.
+        return {"ok": True, "run": {"runId": run_id, "status": "running", "steps": []},
+                "softError": str(exc)[:200]}
+
+
+_IMAGE_TYPES = {"png": "png", "jpg": "jpeg", "jpeg": "jpeg", "gif": "gif",
+                "webp": "webp", "bmp": "bmp"}
+
+
+def _job_read_image(args: dict) -> dict:
+    """One picture a run saved, as a data URL, so a step thumbnail can show the real thing.
+
+    Confined to the projects folder like everything else here - this is the door's only
+    job that hands back file CONTENT a person did not name in a run, so the boundary is
+    the whole security story.
+    """
+    raw = str(args.get("path") or "").strip()
+    if not raw:
+        return {"ok": False, "error": "no path"}
+    base = Path(str(args.get("dir") or ""))
+    target = Path(raw) if os.path.isabs(raw) else (base / raw.lstrip("./\\"))
+    if ".." in raw or not _inside_projects(target):
+        return {"ok": False, "error": "that picture is not inside a XYSY project"}
+    if not target.is_file():
+        return {"ok": False, "error": "not found: %s" % raw}
+    size = target.stat().st_size
+    if size > 12 * 1024 * 1024:
+        return {"ok": False, "error": "too large"}
+    ext = target.suffix.lower().lstrip(".")
+    mime = _IMAGE_TYPES.get(ext)
+    if not mime:
+        return {"ok": False, "error": "not a picture"}
+    import base64
+    return {"ok": True, "bytes": size, "path": str(target),
+            "dataUrl": "data:image/%s;base64,%s"
+                       % (mime, base64.b64encode(target.read_bytes()).decode())}
+
+
+def _job_runs(_args: dict) -> dict:
+    """Every run still alive on this computer, so one that outlived the page can be re-adopted.
+
+    The Local Agent keeps a registry; the door has none and must not invent one, so this
+    reads the ground truth each run already writes: hermes.pid beside progress.json. A pid
+    that is gone means the run is gone - it is not reported as finished, because the door
+    does not know that, and a run that died is not a run that succeeded.
+    """
+    runs = []
+    try:
+        for proj in sorted(PROJECTS_ROOT.iterdir()):
+            rdir = proj / "runs"
+            if not proj.is_dir() or not rdir.is_dir():
+                continue
+            for run in sorted(rdir.iterdir()):
+                pidfile = run / "hermes.pid"
+                if not run.is_dir() or not pidfile.is_file():
+                    continue
+                try:
+                    pid = int(pidfile.read_text(encoding="utf-8").strip())
+                    os.kill(pid, 0)                      # signal 0 = "are you there"
+                except Exception:
+                    continue
+                prog, status = None, "running"
+                try:
+                    prog = json.loads((run / "progress.json").read_text(encoding="utf-8"))
+                    status = prog.get("status") or status
+                except Exception:
+                    pass
+                steps = (prog or {}).get("steps") or []
+                runs.append({"runId": run.name, "pid": pid, "dir": str(proj),
+                             "name": (prog or {}).get("name") or "",
+                             "started": None, "status": status,
+                             "stepsDone": len([s for s in steps if (s or {}).get("status") == "done"]),
+                             "stepsTotal": len(steps),
+                             "kind": "workflow" if prog else "system"})
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    return {"ok": True, "runs": runs}
+
+
+def _job_set_runtime(args: dict) -> dict:
+    """Remember which harness drives workflows, where the runner also looks."""
+    name = str(args.get("runtime") or "").strip()
+    if not name:
+        return {"ok": False, "error": "which runtime?"}
+    try:
+        root = Path(os.path.expanduser("~/.xysy"))
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "runtime.json").write_text(
+            json.dumps({"runtime": name, "at": int(time.time() * 1000)}, indent=2),
+            encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    return {"ok": True, "runtime": name}
+
 JOBS = {"ping": _job_ping, "apps": _job_apps, "servers": _job_servers,
         "capture": _job_capture,
         "project_create": _job_project_create, "run_write": _job_run_write,
@@ -1133,7 +1249,10 @@ JOBS = {"ping": _job_ping, "apps": _job_apps, "servers": _job_servers,
         # XY-DOORSETUP - the setup screen, answerable with Claude closed
         "local_models": _job_local_models, "hermes_status": _job_hermes_status,
         "set_model": _job_set_model, "cloud_link_status": _job_cloud_link_status,
-        "cloud_link_clear": _job_cloud_link_clear}
+        "cloud_link_clear": _job_cloud_link_clear,
+        # XY-DOORPARITY - reporting a run honestly, with Claude nowhere on the machine
+        "run_progress": _job_run_progress, "read_image": _job_read_image,
+        "runs": _job_runs, "set_runtime": _job_set_runtime}
 
 
 # --------------------------------------------------------------------------- door
