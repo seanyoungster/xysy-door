@@ -160,6 +160,38 @@ def select_servers(names, mcp_env):
     return selected, missing
 
 
+# Built-in Hermes toolsets switched off while a run is driving an application. Each one is a
+# way for the model to accomplish the task without touching the app, which both defeats the
+# point and leaves the viewport empty. `file`, `vision`, `skills`, `todo` and `delegation`
+# stay on: a step still has to read its plan, look at what it made, and write its outputs.
+APP_RUN_DISABLED_TOOLSETS = ("terminal", "code_execution", "browser", "web", "computer_use")
+
+
+# XY-NOCODEGEN. Some app connectors expose BOTH typed verbs ("make a box here, this big") and
+# an escape hatch that runs arbitrary code inside the application. A small local model reaches
+# for the escape hatch and then cannot write code that compiles.
+#
+# Measured on run_1786843101699 (qwen3.6:35b, Rhino, 2026-08-15). Every typed call succeeded:
+# get_document_summary, gh_create_document, capture_viewport, the display-mode command. Every
+# code attempt failed: rhinoscript came back "invalid syntax", then C# came back with five
+# compiler errors. In between it ran a script whose only successful act was "Cleared all
+# geometry" - so the escape hatch's single working contribution was destroying the model.
+#
+# So for connectors that have real typed verbs, take the escape hatch away and make the model
+# build through the typed API, where the argument is JSON and there is no syntax to get wrong.
+#
+# Keyed by server id, values are exact tool names or fnmatch globs, matched against the bare
+# name the server reports. Hermes reads this as mcp_servers.<id>.tools.exclude.
+#
+# ONLY list a connector here when it can still do its job without code. Rhino can: it has
+# create_object/create_objects and a full query API. FreeCAD and SketchUp are deliberately
+# ABSENT - their script tool is essentially their whole API, and excluding it would leave the
+# model with nothing at all.
+APP_CODE_ESCAPE_HATCHES = {
+    "rhino": ["execute_rhinoscript_python_code", "execute_rhinocommon_csharp_code"],
+}
+
+
 def build_home(run_id, servers, model, provider, base_url, context_length,
                max_tool_calls, project_dir):
     """Create $HERMES_HOME for this run: config, plugin, skills bridge."""
@@ -192,6 +224,47 @@ def build_home(run_id, servers, model, provider, base_url, context_length,
         "hooks_auto_accept": True,
         "mcp_servers": servers,
     }
+    # XY-MCPWAIT. A run is a ONE-SHOT Hermes session (`hermes -z`). Hermes snapshots the
+    # model's tool list once, at session start, and in one-shot mode there is no second turn,
+    # so its between-turns "late-binding refresh" never fires: any MCP server that finishes
+    # connecting after that snapshot is invisible to the model for the ENTIRE run.
+    #
+    # Hermes bounds how long it waits for discovery. Its one-shot default is 15s, and a cold
+    # `uvx` app server lands right on top of that. Measured on run_1786838624508: the run began
+    # at 18:03:46, the session (and the snapshot) opened at 18:04:03, and the Rhino server
+    # answered its tool list at 18:04:07 — four seconds late. The model then spent twelve
+    # minutes with only the MCP plumbing tools (list_prompts/read_resource) and not one Rhino
+    # verb, which read from the outside exactly like "the model refuses to use the connector".
+    # Every surface said connected, because every surface WAS connected.
+    #
+    # The wait returns the instant discovery finishes, so a warm server still pays ~0s. This
+    # bound only caps a genuinely slow cold start, and paying it is always cheaper than a run
+    # that cannot touch the application it exists to drive.
+    if servers:
+        config["mcp_single_query_discovery_timeout"] = 90.0
+        # XY-NOCODEGEN, applied per server. See the note on APP_CODE_ESCAPE_HATCHES.
+        for _sid, _hatches in APP_CODE_ESCAPE_HATCHES.items():
+            if _sid in servers:
+                _entry = dict(servers[_sid])
+                _tools = dict(_entry.get("tools") or {})
+                # Never widen an include list someone else set; exclusion only.
+                _excl = list(_tools.get("exclude") or [])
+                for _name in _hatches:
+                    if _name not in _excl:
+                        _excl.append(_name)
+                _tools["exclude"] = _excl
+                _entry["tools"] = _tools
+                servers[_sid] = _entry
+        config["mcp_servers"] = servers
+    # XY-APPSCOPE. When this run drives an application, take away the tools that let the model
+    # do the job ITSELF instead of through the app - a local model will happily shell out or
+    # run its own Python rather than call the connector.
+    #
+    # This MUST be done by exclusion here, never by passing `-t` a list of allowed toolsets.
+    # `-t` scopes by inclusion and drops every MCP tool with it, which is exactly how Site Prep
+    # came to make 19 file calls and zero Rhino calls with Rhino open and connected.
+    if servers:
+        config["agent"] = {"disabled_toolsets": list(APP_RUN_DISABLED_TOOLSETS)}
     # Written as JSON on purpose: YAML is a superset of JSON, Hermes parses this
     # file with yaml.safe_load, and hand-rolling YAML quoting for Windows paths
     # and args like `--with mcp==1.28.1` is a bug farm.
@@ -702,6 +775,128 @@ def cmd_think(args):
     print(json.dumps({"ok": True, "text": out, "via": "hermes", "model": model,
                       "web": bool(args.web), "elapsedSec": elapsed}))
 
+# ===== XY-ONEDOC - what does Rhino actually have open right now? ==============================
+# rhinomcp resolves every call to the ACTIVE document, and on macOS `-_Open` makes a second
+# window rather than replacing the current one. Two documents means a step can build correctly
+# and screenshot the other one. Nothing can pin it (RhinoCommon exposes no activate and no
+# close - both are events, not methods), so the run states the fact and the brief says what to
+# do about it.
+RHINO_DEFAULT_PORT = 1999
+_RHINO_LIST_CODE = (
+    "import Rhino\n"
+    "a=Rhino.RhinoDoc.ActiveDoc\n"
+    "print([[(d.Name or ''), d.Objects.Count, bool(d.Modified),"
+    " d.RuntimeSerialNumber==a.RuntimeSerialNumber] for d in Rhino.RhinoDoc.OpenDocuments()])\n"
+)
+
+
+def rhino_documents(port=None, timeout=6.0):
+    """[{name, objects, modified, active}] or None when Rhino does not answer."""
+    import ast, socket
+    port = int(port or os.environ.get("RHINO_PORT") or RHINO_DEFAULT_PORT)
+    payload = json.dumps({"type": "execute_rhinoscript_python_code",
+                          "params": {"code": _RHINO_LIST_CODE}}).encode("utf-8")
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout)
+    except Exception:
+        return None
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(payload)
+        buf = b""
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+            try:
+                reply = json.loads(buf.decode("utf-8", "replace"))
+                break
+            except Exception:
+                continue
+        else:
+            return None
+    except Exception:
+        return None
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+    try:
+        out = (reply.get("result") or {}).get("output") or ""
+        line = [l for l in out.splitlines() if l.strip().startswith("[")]
+        if not line:
+            return None
+        rows = ast.literal_eval(line[0].strip())
+    except Exception:
+        return None
+    docs = []
+    for row in rows:
+        try:
+            docs.append({"name": row[0] or "(unsaved)", "objects": int(row[1]),
+                         "modified": bool(row[2]), "active": bool(row[3])})
+        except Exception:
+            continue
+    return docs or None
+
+
+# A healthy Rhino sits around 30-55 threads. Past this it is measurably eating the machine
+# and every turn slows down, which reads from the outside as a slow model.
+RHINO_THREAD_ALARM = int(os.environ.get("XYSY_RHINO_THREAD_ALARM", "600") or 600)
+
+
+def rhino_threads():
+    """(pid, thread_count, uptime) for a running Rhino, or None. Never raises."""
+    try:
+        pid = subprocess.check_output(["pgrep", "-x", "Rhinoceros"]).split()[0].decode()
+    except Exception:
+        return None
+    try:
+        n = len(subprocess.check_output(["ps", "-M", pid]).decode().splitlines()) - 1
+        up = subprocess.check_output(["ps", "-o", "etime=", "-p", pid]).decode().strip()
+    except Exception:
+        return None
+    return {"pid": int(pid), "threads": n, "uptime": up}
+
+
+def rhino_leak_notice(info):
+    """The sentence the person sees in the run console. Empty when Rhino is healthy."""
+    if not info or info["threads"] < RHINO_THREAD_ALARM:
+        return ""
+    return ("Rhino has been open a long time and is now running %d internal threads "
+            "(a fresh Rhino runs about 40). Its MCP plug-in leaks one every time anything "
+            "connects to it, and at this level Rhino eats the processor and everything in "
+            "this run gets slower -- which looks like a slow model but is not. Quit and "
+            "reopen Rhino when this run finishes." % info["threads"])
+
+
+def rhino_state_brief(docs):
+    """The plain-words paragraph that goes at the top of a Rhino step's prompt."""
+    if not docs:
+        return ""
+    front = ([d for d in docs if d["active"]] or [docs[0]])[0]
+    lines = ["RHINO RIGHT NOW - read this before your first tool call.",
+             "Rhino has %d drawing%s open:" % (len(docs), "" if len(docs) == 1 else "s")]
+    for d in docs:
+        lines.append("  - \"%s\" - %d object%s%s%s"
+                     % (d["name"], d["objects"], "" if d["objects"] == 1 else "s",
+                        ", unsaved changes" if d["modified"] else "",
+                        "   <- this one is in front" if d["active"] else ""))
+    if len(docs) > 1:
+        lines.append("Rhino answers EVERY one of your calls in whichever drawing is in front, and "
+                     "that can change between calls. With more than one open you cannot build "
+                     "safely and you cannot trust a screenshot. Do not open, create or close "
+                     "anything: report status \"blocked\" with the reason "
+                     "\"Rhino has %d drawings open - close all but one and run again\"."
+                     % len(docs))
+    else:
+        lines.append("Exactly one drawing is open, which is what you want. Keep it that way: "
+                     "build in \"%s\" and never open, create or close a drawing."
+                     % front["name"])
+    return "\n".join(lines) + "\n\n"
+
+
 def pidfile(project_dir, run_id):
     return os.path.join(project_dir, "runs", run_id, "hermes.pid")
 
@@ -730,28 +925,45 @@ def cmd_start(args):
             "invocation, and never reuse a previous run's outputs." % args.run_id
         )
 
+    # XY-HZMODEL: `start` was the one command that never asked the machine what model it
+    # has. With Auto picked on the canvas the page sends no model, the per-run home got an
+    # empty model block, and Hermes fell through to its packaged default provider - no key,
+    # 401, dead in about five seconds. Resolve exactly the way `probe` and `think` do.
+    cfg = read_user_model_config()
+    model = args.model or cfg.get("default") or cfg.get("model")
+    provider = args.provider or cfg.get("provider")
+    base_url = args.base_url or cfg.get("base_url")
+    # ollama_num_ctx FIRST: context_length is what Hermes believes the window is, while
+    # ollama_num_ctx is what the runtime allocates - and it is usually the only one set.
+    context_length = (args.context_length or cfg.get("ollama_num_ctx")
+                      or cfg.get("context_length") or MIN_CONTEXT)
+    if not model:
+        die("no model is configured for Hermes on this machine - run `hermes setup`, "
+            "or set model.default")
+
     mcp_env = json.loads(args.mcp_env) if args.mcp_env else {}
     servers, missing = select_servers(
         None if args.servers is None else [s.strip() for s in args.servers.split(",")],
         mcp_env,
     )
     home, bridged = build_home(
-        args.run_id, servers, args.model, args.provider, args.base_url,
-        args.context_length, args.max_tool_calls, project_dir,
+        args.run_id, servers, model, provider, base_url,
+        context_length, args.max_tool_calls, project_dir,
     )
 
     argv = [hermes, "-z", prompt, "--in", project_dir, "--yolo", "--accept-hooks",
             "--usage-file", os.path.join(run_dir, "usage.json")]
-    if args.model:
-        argv += ["-m", args.model]
-    if args.provider:
-        argv += ["--provider", args.provider]
+    if model:
+        argv += ["-m", model]
+    if provider:
+        argv += ["--provider", provider]
     if args.reasoning:
         argv += ["--reasoning", args.reasoning]
     if args.toolsets:
         argv += ["-t", args.toolsets]
-    if args.skills:
-        argv += ["-s", args.skills]
+    skills = args.skills or ",".join(bridged)
+    if skills:
+        argv += ["-s", skills]
     if args.worktree:
         argv.append("--worktree")
 
@@ -759,8 +971,65 @@ def cmd_start(args):
     env["HERMES_HOME"] = home
     env["XYSY_RUN_DIR"] = run_dir          # arms the instrumentation plugin
     env["XYSY_RUN_ID"] = args.run_id
-    if args.model:
-        env["HERMES_INFERENCE_MODEL"] = args.model
+    if env_notice:
+        env["XYSY_NOTICE"] = env_notice        # XY-RHINOLEAK: surfaced by the plugin
+    shot = getattr(args, "shot", None)
+    if not shot:
+        # Derive it: a per-step sub-run is "<parentRunId>__n<node>" (with "r2" on a retry),
+        # and its capture belongs in the PARENT run's shots folder, which is where the run
+        # theater looks. A whole-workflow run has no single node, so it gets nothing here.
+        m = re.match(r"^(.+?)__n(\d+)", args.run_id or "")
+        if m:
+            shot = os.path.join(project_dir, "runs", m.group(1), "shots", "n%s.png" % m.group(2))
+    if shot:
+        # XY-SHOTCOPY: the plugin copies each capture here as it happens, so the preview the
+        # person watches is the app's own image rather than whatever the model managed to write.
+        shot = os.path.abspath(os.path.expanduser(shot))
+        try:
+            os.makedirs(os.path.dirname(shot), exist_ok=True)
+        except Exception:
+            pass
+        env["XYSY_SHOT_PATH"] = shot
+    if model:
+        env["HERMES_INFERENCE_MODEL"] = model
+
+    # XY-RHINOLEAK: how badly has Rhino's thread leak grown? Recorded either way.
+    if "rhino" in servers:
+        try:
+            _leak = rhino_threads()
+        except Exception:
+            _leak = None
+        if _leak:
+            try:
+                with open(os.path.join(run_dir, "rhino-threads.json"), "w",
+                          encoding="utf-8") as _h:
+                    json.dump(_leak, _h, indent=2)
+            except Exception:
+                pass
+            _note = rhino_leak_notice(_leak)
+            if _note:
+                env_notice = _note
+            else:
+                env_notice = None
+        else:
+            env_notice = None
+    else:
+        env_notice = None
+
+    # XY-ONEDOC: look at Rhino before the step does, record it, and say it in the brief.
+    if "rhino" in servers:
+        try:
+            _docs = rhino_documents((mcp_env.get("rhino") or {}).get("RHINO_PORT"))
+        except Exception:
+            _docs = None
+        if _docs:
+            try:
+                with open(os.path.join(run_dir, "rhino-docs.json"), "w",
+                          encoding="utf-8") as _h:
+                    json.dump({"at": time.time(), "documents": _docs}, _h, indent=2)
+            except Exception:
+                pass
+            prompt = rhino_state_brief(_docs) + (prompt or "")
 
     log_path = os.path.join(run_dir, "hermes.log")
     try:
@@ -780,7 +1049,8 @@ def cmd_start(args):
 
     print(json.dumps({
         "ok": True, "harness": "hermes", "pid": child.pid, "runId": args.run_id,
-        "hermesHome": home, "model": args.model, "servers": sorted(servers.keys()),
+        "hermesHome": home, "model": model, "provider": provider,
+        "contextLength": context_length, "servers": sorted(servers.keys()),
         "missingServers": missing, "skillsBridged": bridged,
         "events": os.path.join(run_dir, "hermes-events.ndjson"), "log": log_path,
     }))
@@ -900,6 +1170,8 @@ def main():
     start.add_argument("--servers", help="comma-separated registry server ids (default: all app servers)")
     start.add_argument("--mcp-env", dest="mcp_env", help="JSON {server: {ENV: val}}; '*' applies to all")
     start.add_argument("--toolsets", "-t")
+    # XY-SHOTCOPY: absolute path of the PNG this run's viewport captures should land in.
+    start.add_argument("--shot")
     start.add_argument("--skills", "-s")
     start.add_argument("--reasoning")
     start.add_argument("--worktree", action="store_true")

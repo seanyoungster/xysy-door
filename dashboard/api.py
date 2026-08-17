@@ -68,7 +68,7 @@ except Exception:  # pragma: no cover - only when FastAPI is absent
     APIRouter = None
 
 # A blank page at :4850/xysy is a STALE door, not a broken one - this is the fingerprint.
-DOOR_VERSION = "0.6.0"
+DOOR_VERSION = "0.6.1"
 DOOR_PORT = int(os.environ.get("XYSY_DOOR_PORT", "4850"))
 
 # Who may knock. A browser sends its page's origin; anything not on this list is
@@ -1136,16 +1136,29 @@ def _job_run_progress(args: dict) -> dict:
     run_id = str(args.get("runId") or "")
     if not run_id or not _inside_projects(d):
         return {"ok": True, "run": None}
+    # XY-RUNSEE - optionally the run's PLAN too. A browser that did not start this run holds no
+    # copy of the workflow, so without the plan the only name it can give a step is its id. The
+    # file sits in the same run folder as progress.json; this reaches no further than we already do.
+    plan = None
+    if args.get("plan"):
+        pf = d / "runs" / run_id / "plan.json"
+        if pf.is_file():
+            try:
+                p = json.loads(pf.read_text(encoding="utf-8"))
+                if isinstance(p, dict) and p.get("nodes"):
+                    plan = p
+            except Exception:
+                plan = None
     f = d / "runs" / run_id / "progress.json"
     if not f.is_file():
-        return {"ok": True, "run": {"runId": run_id, "status": "queued", "steps": []}}
+        return {"ok": True, "run": {"runId": run_id, "status": "queued", "steps": []}, "plan": plan}
     try:
-        return {"ok": True, "run": json.loads(f.read_text(encoding="utf-8"))}
+        return {"ok": True, "run": json.loads(f.read_text(encoding="utf-8")), "plan": plan}
     except Exception as exc:
         # Half-written by a run that is mid-save. 'running' with no steps is honest;
         # 'error' would be a verdict the door is not entitled to reach.
         return {"ok": True, "run": {"runId": run_id, "status": "running", "steps": []},
-                "softError": str(exc)[:200]}
+                "plan": plan, "softError": str(exc)[:200]}
 
 
 _IMAGE_TYPES = {"png": "png", "jpg": "jpeg", "jpeg": "jpeg", "gif": "gif",

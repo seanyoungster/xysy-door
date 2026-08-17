@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import threading
 import time
 
@@ -47,6 +49,103 @@ _RUN_DIR = None
 _EVENTS_PATH = None
 _STATUS_PATH = None
 
+# XY-SHOTCOPY -----------------------------------------------------------------
+# Where this run's viewport captures should land, and how to recognise one. An app's
+# capture tool answers with a path into the harness cache (rhinomcp returns
+# "MEDIA:~/.xysy/hermes-runs/<run>/cache/images/img_*.png"); the step was then asked to
+# copy that file itself and could not, because its only writing tool writes text.
+_SHOT_PATH = None
+_SHOT_N = 0
+_MEDIA_RE = re.compile(r"(?:MEDIA:\s*)?((?:~|/)[^\s\"'\\,;)\]}]+\.(?:png|jpg|jpeg|webp))", re.I)
+
+
+def _shot_candidates(value):
+    """Every image path mentioned in a tool result, best (MEDIA:-tagged) first."""
+    try:
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+    except Exception:
+        return []
+    tagged, plain = [], []
+    for m in _MEDIA_RE.finditer(text):
+        (tagged if m.group(0).upper().startswith("MEDIA") else plain).append(m.group(1))
+    return tagged + plain
+
+
+_LAST_MEDIA = None
+_PENDING_SHOT = None
+_SHOTFILE_RE = re.compile(r"((?:~|/)[^\s\"'\\,;)\]}]*shots/[^\s\"'\\,;)\]}]+\.(?:png|jpg|jpeg))", re.I)
+
+
+def _remember_media(result):
+    """Hold on to the newest real capture an app returned, whoever asked for it."""
+    global _LAST_MEDIA
+    for cand in _shot_candidates(result):
+        src = os.path.abspath(os.path.expanduser(cand))
+        try:
+            if os.path.isfile(src) and os.path.getsize(src) > 0:
+                _LAST_MEDIA = src
+                return
+        except Exception:
+            continue
+
+
+def _note_shot_target(args):
+    """pre_tool_call is the hook that reliably carries args -- remember the path here."""
+    global _PENDING_SHOT
+    _PENDING_SHOT = None
+    try:
+        text = args if isinstance(args, str) else json.dumps(args, default=str)
+    except Exception:
+        return
+    m = _SHOTFILE_RE.search(text or "")
+    if m:
+        _PENDING_SHOT = os.path.abspath(os.path.expanduser(m.group(1)))
+
+
+def _fill_written_shot():
+    """The model just wrote a shots/*.png with its TEXT writer. Put the real image there."""
+    global _PENDING_SHOT
+    dst, _PENDING_SHOT = _PENDING_SHOT, None
+    if not _LAST_MEDIA or not dst:
+        return None
+    if dst == _LAST_MEDIA:
+        return None
+    try:
+        # Only step in when what landed is not already a real image -- never clobber a
+        # step that genuinely managed to save its own capture.
+        if os.path.isfile(dst) and os.path.getsize(dst) >= os.path.getsize(_LAST_MEDIA):
+            return None
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".part"
+        shutil.copyfile(_LAST_MEDIA, tmp)
+        os.replace(tmp, dst)
+        return {"from": _LAST_MEDIA, "to": dst, "bytes": os.path.getsize(dst)}
+    except Exception:
+        return None
+
+
+def _copy_shot(result):
+    """Copy the capture an app just produced into the run's shots/ file. Never raises."""
+    global _SHOT_N
+    if not _SHOT_PATH:
+        return None
+    for cand in _shot_candidates(result):
+        src = os.path.abspath(os.path.expanduser(cand))
+        if src == _SHOT_PATH:
+            return None
+        try:
+            if not os.path.isfile(src) or os.path.getsize(src) <= 0:
+                continue
+            tmp = _SHOT_PATH + ".part"
+            shutil.copyfile(src, tmp)
+            os.replace(tmp, _SHOT_PATH)
+            _SHOT_N += 1
+            return {"from": src, "to": _SHOT_PATH, "bytes": os.path.getsize(_SHOT_PATH)}
+        except Exception:
+            continue
+    return None
+
+
 _STARTED_AT = time.time()
 _COUNTS = {"api_calls": 0, "tool_calls": 0, "tool_errors": 0, "subagents": 0}
 _TOOL_T0 = {}           # tool_call_id -> start monotonic
@@ -57,6 +156,9 @@ _LAST = {"event": None, "tool": None, "at": None}
 # model thinking hard and a process that died.
 _WAITING = {"on": None, "since": None}
 _FINISHED_AT = None
+# XY-SUBEND: the run's own session id. A delegated sub-agent opens and closes a
+# session of its own mid-run, and only the root session ending means the run is over.
+_ROOT_SESSION = None
 _BEAT = None
 _BEAT_SECONDS = float(os.environ.get("XYSY_HEARTBEAT_SECONDS", "3") or 3)
 
@@ -98,6 +200,14 @@ def _init():
         return False
     _RUN_DIR = run_dir
     _EVENTS_PATH = os.path.join(run_dir, "hermes-events.ndjson")
+    global _SHOT_PATH
+    shot = os.environ.get("XYSY_SHOT_PATH", "").strip()
+    if shot:
+        _SHOT_PATH = os.path.abspath(os.path.expanduser(shot))
+        try:
+            os.makedirs(os.path.dirname(_SHOT_PATH), exist_ok=True)
+        except Exception:
+            _SHOT_PATH = None
     _STATUS_PATH = os.path.join(run_dir, "hermes-status.json")
     _start_beat()
     return True
@@ -182,6 +292,9 @@ def _write_status():
 # so naming parameters positionally would break on the next Hermes release.
 
 def on_session_start(**kwargs):
+    global _ROOT_SESSION
+    if _ROOT_SESSION is None and kwargs.get("session_id"):
+        _ROOT_SESSION = kwargs.get("session_id")     # XY-SUBEND: first one wins
     _emit("session_start",
           session_id=kwargs.get("session_id"),
           task_id=kwargs.get("task_id"),
@@ -190,11 +303,21 @@ def on_session_start(**kwargs):
 
 
 def on_session_end(**kwargs):
+    # XY-SUBEND: this fired for a delegated sub-agent too, and setting _FINISHED_AT
+    # both froze the snapshot at "finished" and killed the heartbeat thread. XYSY read
+    # that as the session ending, took its verdict from a progress.json that still said
+    # "running" with nothing done, and told the person the run FAILED - while the parent
+    # session went on working for another 74 seconds. Measured on run_1786864518322,
+    # Diyara Demo, nemotron-3.5-lightning, 2026-08-16.
     global _FINISHED_AT
-    _FINISHED_AT = round(time.time(), 3)
-    _WAITING["on"], _WAITING["since"] = None, None
+    sid = kwargs.get("session_id")
+    is_root = (sid is None) or (_ROOT_SESSION is None) or (sid == _ROOT_SESSION)
+    if is_root:
+        _FINISHED_AT = round(time.time(), 3)
+        _WAITING["on"], _WAITING["since"] = None, None
     _emit("session_end",
-          session_id=kwargs.get("session_id"),
+          session_id=sid,
+          root=is_root,
           reason=kwargs.get("reason") or kwargs.get("status"))
 
 
@@ -235,6 +358,13 @@ def api_request_error(**kwargs):
 
 
 def pre_tool_call(**kwargs):
+    # XY-SHOTCOPY: this is the hook that carries the arguments. If the model is about to
+    # write a shots/*.png with its text writer, remember where, so the real capture can be
+    # dropped in behind it the moment the call returns.
+    try:
+        _note_shot_target(kwargs.get("args"))
+    except Exception:
+        pass
     _WAITING["on"], _WAITING["since"] = (kwargs.get("tool_name") or "a tool"), time.time()
     _COUNTS["tool_calls"] += 1
     call_id = kwargs.get("tool_call_id")
@@ -253,6 +383,19 @@ def pre_tool_call(**kwargs):
 
 
 def post_tool_call(**kwargs):
+    # XY-SHOTCOPY: do this BEFORE the event is written, so the copied byte count is in the
+    # same feed line that reports the capture -- that is what makes the fix provable.
+    copied = None
+    try:
+        _remember_media(kwargs.get("result"))
+        copied = _copy_shot(kwargs.get("result"))
+        if not copied:
+            copied = _fill_written_shot()
+    except Exception:
+        copied = None
+    if copied:
+        _emit("shot_saved", tool=kwargs.get("tool_name"),
+              path=copied["to"], source=copied["from"], bytes=copied["bytes"])
     _WAITING["on"], _WAITING["since"] = None, None
     call_id = kwargs.get("tool_call_id")
     started = _TOOL_T0.pop(call_id, None) if call_id else None
@@ -300,3 +443,9 @@ def register(ctx):
     ctx.register_hook("subagent_start", subagent_start)
     ctx.register_hook("subagent_stop", subagent_stop)
     _emit("plugin_loaded", plugin="xysy_progress", version="0.1.0")
+    # XY-RHINOLEAK: something the PERSON needs to read, not the model. The launcher measures
+    # it before the run starts and hands it over here, because the event feed is the only
+    # channel that reaches the run console.
+    _notice = os.environ.get("XYSY_NOTICE", "").strip()
+    if _notice:
+        _emit("notice", text=_notice)
