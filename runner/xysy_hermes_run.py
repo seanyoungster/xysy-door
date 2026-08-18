@@ -971,6 +971,11 @@ def cmd_start(args):
     env["HERMES_HOME"] = home
     env["XYSY_RUN_DIR"] = run_dir          # arms the instrumentation plugin
     env["XYSY_RUN_ID"] = args.run_id
+    # XY-HZSTART: this is READ here and only ASSIGNED ~40 lines below, in the XY-RHINOLEAK
+    # block, so every cmd_start raised UnboundLocalError and no Hermes run ever launched.
+    # Default it where it is first used; the block below still overwrites it when it has
+    # something to say. A plain default is the whole fix - the block below still runs.
+    env_notice = None
     if env_notice:
         env["XYSY_NOTICE"] = env_notice        # XY-RHINOLEAK: surfaced by the plugin
     shot = getattr(args, "shot", None)
@@ -1042,7 +1047,30 @@ def cmd_start(args):
                     "stdout": log, "stderr": subprocess.STDOUT}
     if os.name == "posix":
         popen_kwargs["start_new_session"] = True
-    child = subprocess.Popen(argv, **popen_kwargs)
+    # XY-HZFINISH: spawn the supervisor rather than Hermes itself. It owns the process group
+    # and the pid file - so Stop, liveness and the status poll all behave exactly as before -
+    # and it runs Hermes again when a session ends with the plan unfinished.
+    spec_path = os.path.join(run_dir, "hermes-supervise.json")
+    try:
+        with open(spec_path, "w", encoding="utf-8") as handle:
+            json.dump({"argv": argv, "runDir": run_dir, "runId": args.run_id,
+                       "log": log_path, "cwd": project_dir,
+                       "maxAttempts": SUPERVISE_MAX}, handle, indent=2)
+        sup_env = dict(env)
+        sup_env[SUPERVISE_ENV] = spec_path
+        sup_kwargs = dict(popen_kwargs)
+        sup_kwargs["env"] = sup_env
+        # the supervisor opens the run log itself, one attempt after another; its own
+        # stderr goes somewhere separate so a fault in it is never mistaken for the model's
+        try:
+            sup_log = open(os.path.join(run_dir, "hermes-supervise.log"), "w")
+        except Exception:
+            sup_log = subprocess.DEVNULL
+        sup_kwargs["stdout"] = sup_log
+        sup_kwargs["stderr"] = subprocess.STDOUT
+        child = subprocess.Popen([sys.executable, os.path.abspath(__file__)], **sup_kwargs)
+    except Exception:
+        child = subprocess.Popen(argv, **popen_kwargs)   # never let the run fail to start
 
     with open(pidfile(project_dir, args.run_id), "w", encoding="utf-8") as handle:
         handle.write(str(child.pid))
@@ -1147,7 +1175,138 @@ def cmd_stop(args):
     print(json.dumps({"ok": True, "stopped": True, "pid": pid}))
 
 
+# ------------------------------------------------------------------ XY-HZFINISH
+# A run ends when the PLAN is finished, not when the model stops talking. See the
+# note at the top of scripts/patch_hzfinish_0818.py for the three measured runs
+# that made this necessary.
+SUPERVISE_ENV = "XYSY_HZ_SUPERVISE"
+SUPERVISE_MAX = 4
+
+RESUME_PROMPT = (
+    "The previous session ended before this run was finished. Nothing is lost - the "
+    "application still holds everything that was already built, and it must stay there.\n\n"
+    "1. Read %(run_md)s.\n"
+    "2. Read %(progress)s and work out which steps are NOT yet marked done.\n"
+    "3. Continue from the first of those. Do NOT start over, do NOT clear or delete "
+    "anything, and do NOT redo a step that is already marked done.\n"
+    "4. Keep calling your tools until the work is actually made in the application - a "
+    "described result is a failed step.\n"
+    "5. Write each step's status into %(progress)s as you finish it, and set the "
+    "top-level \"status\" when the whole plan is done or blocked. A run that never sets "
+    "it reads as unfinished, however much was built."
+)
+
+
+def _terminal_status(value):
+    return str(value or "").strip().lower() in ("done", "blocked", "error", "cancelled", "stopped")
+
+
+def _supervise(spec_path):
+    """Own the process group and the pid file; keep the run going until the plan ends."""
+    spec = load_json(spec_path) or {}
+    argv = list(spec.get("argv") or [])
+    run_dir = spec.get("runDir") or ""
+    run_id = spec.get("runId") or ""
+    cwd = spec.get("cwd") or None
+    log_path = spec.get("log") or os.path.join(run_dir, "hermes.log")
+    tries = int(spec.get("maxAttempts") or SUPERVISE_MAX)
+    if not argv or not run_dir:
+        return
+    progress_path = os.path.join(run_dir, "progress.json")
+    status_path = os.path.join(run_dir, "hermes-status.json")
+    stop_path = os.path.join(run_dir, "STOP")
+    attempts = []
+    stopped_by_person = False
+
+    for i in range(tries):
+        try:
+            log = open(log_path, "a" if i else "w")
+        except Exception:
+            log = subprocess.DEVNULL
+        # NOT a new session: the child stays in the supervisor's process group, so the
+        # existing killpg in cmd_stop takes the whole tree down exactly as before.
+        try:
+            child = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL,
+                                     stdout=log, stderr=subprocess.STDOUT)
+        except Exception as exc:
+            attempts.append({"attempt": i + 1, "error": str(exc)})
+            break
+        code = child.wait()
+        try:
+            if log not in (subprocess.DEVNULL,):
+                log.close()
+        except Exception:
+            pass
+
+        st = load_json(status_path) or {}
+        tools = int(((st.get("counts") or {}).get("tool_calls")) or 0)
+        pr = load_json(progress_path) or {}
+        attempts.append({"attempt": i + 1, "exit": code, "toolCalls": tools,
+                         "progressStatus": pr.get("status"),
+                         "at": round(time.time(), 3)})
+        try:
+            with open(os.path.join(run_dir, "hermes-attempts.json"), "w", encoding="utf-8") as handle:
+                json.dump({"runId": run_id, "attempts": attempts}, handle, indent=2)
+        except Exception:
+            pass
+
+        if _terminal_status(pr.get("status")):
+            return                       # the model said how it went. Nothing to add.
+        if os.path.exists(stop_path):
+            stopped_by_person = True
+            break
+        if tools <= 0:
+            break                        # it did nothing at all; running it again would spin
+        if i + 1 >= tries:
+            break
+
+        # Keep the run readable as still-going across the gap: the plugin sets finishedAt at
+        # session_end, and XYSY reads alive as "process there AND not finished". Without this
+        # the one second between attempts looks like a death.
+        try:
+            st["finishedAt"] = None
+            st["state"] = "resuming"
+            with open(status_path, "w", encoding="utf-8") as handle:
+                json.dump(st, handle, indent=2)
+        except Exception:
+            pass
+        try:
+            with open(log_path, "a") as handle:
+                handle.write("\n[xysy] the session ended with the run unfinished — "
+                             "continuing from progress.json (attempt %d of %d)\n"
+                             % (i + 2, tries))
+        except Exception:
+            pass
+        argv = list(argv)
+        argv[2] = RESUME_PROMPT % {
+            "run_md": os.path.join(run_dir, "RUN.md"),
+            "progress": os.path.join(run_dir, "progress.json"),
+        }
+
+    # Out of attempts, or it stopped doing anything. Say so where the file says it - a run
+    # that has ended must not keep reading "running". No STEP is touched: whatever the model
+    # marked is what stands.
+    pr = load_json(progress_path) or {}
+    if not _terminal_status(pr.get("status")) and not stopped_by_person:
+        pr["runId"] = pr.get("runId") or run_id
+        pr["status"] = "error"
+        pr["note"] = ("the model ended its session %d time%s without finishing this run — "
+                      "what it did report is below, and nothing has been marked done on its "
+                      "behalf" % (len(attempts), "" if len(attempts) == 1 else "s"))
+        pr.setdefault("steps", [])
+        try:
+            with open(progress_path, "w", encoding="utf-8") as handle:
+                json.dump(pr, handle, indent=2)
+        except Exception:
+            pass
+
+
 def main():
+    # XY-HZFINISH: same file, second job. Set by cmd_start when it spawns the supervisor.
+    _spec = os.environ.get(SUPERVISE_ENV)
+    if _spec:
+        _supervise(_spec)
+        return
     parser = argparse.ArgumentParser(description="Run a XYSY workflow on the Hermes harness")
     subparsers = parser.add_subparsers(dest="cmd", required=True)
 

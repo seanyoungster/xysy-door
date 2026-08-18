@@ -68,7 +68,7 @@ except Exception:  # pragma: no cover - only when FastAPI is absent
     APIRouter = None
 
 # A blank page at :4850/xysy is a STALE door, not a broken one - this is the fingerprint.
-DOOR_VERSION = "0.6.1"
+DOOR_VERSION = "0.7.3"
 DOOR_PORT = int(os.environ.get("XYSY_DOOR_PORT", "4850"))
 
 # Who may knock. A browser sends its page's origin; anything not on this list is
@@ -423,6 +423,142 @@ def _mcp_call(entry: dict, tool: str, args: dict, timeout: float = 60.0) -> dict
     finally:
         _end(proc)
     return result
+
+
+def _says_error(text: str) -> bool:
+    """An application's own words outrank its envelope.
+
+    blender-mcp answers "Error executing code: Could not connect to Blender" with
+    isError FALSE. Trusting the flag alone reports that as a success - the exact bug
+    call_tool exists to prevent. Narrow on purpose: the reply has to LEAD with the
+    complaint, or say it could not connect.
+    """
+    t = str(text or "").strip()
+    if not t:
+        return False
+    return bool(re.match(r"(?i)^(error\b|exception\b|traceback \(most recent call last\))", t)
+                or re.search(r"(?i)could not connect to", t))
+
+
+def _mcp_call_text(entry: dict, tool: str, args: dict, timeout: float = 180.0) -> dict:
+    """One tool call against a stdio connector, for a call whose answer is TEXT.
+
+    _mcp_call is the capture path: it wants an image back and reports text as a failure.
+    Driving an application is the opposite - "Code executed successfully" IS the answer.
+    Same short-lived process, same handshake, different idea of success.
+
+    An MCP error, or an isError envelope carrying the application's own complaint, is
+    returned ok:False. This job exists because a stand-in once answered ok:true and three
+    steps went green over an untouched scene (XY-PLAYTRUTH); it must not repeat that.
+    """
+    command = entry.get("command")
+    if not command:
+        return {"ok": False, "error": "that connector has no way to start"}
+    env = dict(os.environ)
+    env.update({k: str(v) for k, v in (entry.get("env") or {}).items()})
+    extra = [str(Path.home() / ".local" / "bin"), "/opt/homebrew/bin", "/usr/local/bin"]
+    env["PATH"] = os.pathsep.join([env.get("PATH", "")] + extra)
+    try:
+        proc = subprocess.Popen(
+            [command] + [str(a) for a in (entry.get("args") or [])],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=env, text=True, bufsize=1,
+            start_new_session=(os.name != "nt"),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+
+    def send(obj):
+        try:
+            proc.stdin.write(json.dumps(obj) + "\n")
+            proc.stdin.flush()
+        except Exception:
+            pass
+
+    result = {"ok": False, "error": "the connector never answered"}
+    deadline = time.time() + timeout
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "clientInfo": {"name": "xysy-door", "version": DOOR_VERSION}}})
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                msg = json.loads(line)
+            except Exception:
+                continue
+            if msg.get("id") == 1 and msg.get("result") is not None:
+                send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                      "params": {"name": tool, "arguments": args or {}}})
+            elif msg.get("id") == 2:
+                if msg.get("error"):
+                    result = {"ok": False, "error": str((msg["error"] or {}).get("message"))[:300]}
+                    break
+                res = msg.get("result") or {}
+                said = "\n".join(c.get("text", "") for c in (res.get("content") or [])).strip()
+                if res.get("isError") or _says_error(said):
+                    result = {"ok": False, "error": said[:300] or "the application refused the call"}
+                else:
+                    result = {"ok": True, "text": said, "result": res}
+                break
+    finally:
+        _end(proc)
+    return result
+
+
+def _connector_entry(name: str) -> dict:
+    """How to start ONE connector: Hermes' config first, then XYSY's own registry.
+
+    _hermes_servers() is deliberately Hermes-only, because _job_servers must describe
+    Hermes rather than us. But a RUN never uses that file either - it writes a per-run
+    Hermes profile from ~/.xysy/registry.json - so on a normally set up machine the
+    global config is empty and asking only it means the door can drive nothing.
+
+    The boundary this door exists to hold is that the PAGE never hands this computer a
+    command line. It does not: it names an app. Which local file records the command for
+    that app is our business, and registry.json is the one XYSY actually keeps.
+    """
+    name = str(name or "").strip()
+    if not name:
+        return {}
+    entry = _hermes_servers().get(name)
+    if isinstance(entry, dict) and entry.get("command"):
+        return entry
+    try:
+        reg = json.loads((Path.home() / ".xysy" / "registry.json").read_text(encoding="utf-8"))
+        ours = (reg.get("servers") or {}).get(name)
+        if isinstance(ours, dict) and ours.get("command"):
+            return ours
+    except Exception:
+        pass
+    return entry if isinstance(entry, dict) else {}
+
+
+def _job_call_tool(args: dict) -> dict:
+    """Run ONE tool on a connected application and return what it said.
+
+    The page names the application and the tool. It never names a command - the command
+    comes from Hermes' own connector config here, which is what keeps a web page from
+    handing this computer a command line (see scripts/verify_door_boundary.mjs).
+    """
+    name = str(args.get("server") or "").strip()
+    tool = str(args.get("tool") or "").strip()
+    if not name:
+        return {"ok": False, "error": "no application was named"}
+    if not tool:
+        return {"ok": False, "error": "no tool was named"}
+    entry = _connector_entry(name)
+    if not entry or not entry.get("command"):
+        return {"ok": False, "error": "no connector called %s on this computer" % name}
+    out = _mcp_call_text(entry, tool, args.get("args") or {},
+                         timeout=float(args.get("timeout") or 180))
+    return dict(out, server=name, tool=tool)
 
 
 def _job_servers(_args: dict) -> dict:
@@ -1257,6 +1393,9 @@ JOBS = {"ping": _job_ping, "apps": _job_apps, "servers": _job_servers,
         "run_stop": _job_run_stop, "read_output": _job_read_output,
         "system": _job_system, "think": _job_think,
         "server_verify": _job_server_verify, "projects": _job_projects,
+        # XY-DOORCALL - the Hermes half of XY-CALLTOOL: hand a script to an application
+        # with Claude Desktop closed. App name and tool name only, never a command line.
+        "call_tool": _job_call_tool,
         "open": _job_open, "inventory": _job_inventory,
         "stage_skills": _job_stage_skills,
         # XY-DOORSETUP - the setup screen, answerable with Claude closed
